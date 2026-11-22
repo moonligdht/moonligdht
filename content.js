@@ -1,45 +1,231 @@
-// Vercel serverless function. Keep NOTION_TOKEN on the server only.
-const sections = ['profile','experience','education','research','toolkit'];
-const envNames = {profile:'NOTION_PROFILE_DATA_SOURCE_ID',experience:'NOTION_EXPERIENCE_DATA_SOURCE_ID',education:'NOTION_EDUCATION_DATA_SOURCE_ID',research:'NOTION_RESEARCH_DATA_SOURCE_ID',toolkit:'NOTION_TOOLKIT_DATA_SOURCE_ID'};
+
+/**
+ * moonligdht — Notion CMS API
+ * Vercel Serverless Function
+ *
+ * IMPORTANT:
+ * Keep NOTION_TOKEN in Vercel Environment Variables.
+ * Never expose it in frontend JavaScript.
+ */
+
+const sections = [
+  "profile",
+  "experience",
+  "education",
+  "research",
+  "toolkit"
+];
+
+const envNames = {
+  profile: "NOTION_PROFILE_DATA_SOURCE_ID",
+  experience: "NOTION_EXPERIENCE_DATA_SOURCE_ID",
+  education: "NOTION_EDUCATION_DATA_SOURCE_ID",
+  research: "NOTION_RESEARCH_DATA_SOURCE_ID",
+  toolkit: "NOTION_TOOLKIT_DATA_SOURCE_ID"
+};
+
+// Read a Notion property safely
 function prop(page, key) {
   const p = page.properties?.[key];
-  if (!p) return '';
-  if (p.type === 'title' || p.type === 'rich_text') return (p[p.type] || []).map(x => x.plain_text).join('');
-  if (p.type === 'select') return p.select?.name || '';
-  if (p.type === 'url') return p.url || '';
-  if (p.type === 'date') return p.date?.start || '';
-  if (p.type === 'number') return p.number ?? '';
-  if (p.type === 'checkbox') return p.checkbox;
-  return '';
+
+  if (!p) return "";
+
+  switch (p.type) {
+    case "title":
+    case "rich_text":
+      return (p[p.type] || [])
+        .map(item => item.plain_text || "")
+        .join("");
+
+    case "select":
+      return p.select?.name || "";
+
+    case "url":
+      return p.url || "";
+
+    case "date":
+      return p.date?.start || "";
+
+    case "number":
+      return p.number ?? "";
+
+    case "checkbox":
+      return p.checkbox ?? false;
+
+    default:
+      return "";
+  }
 }
-async function queryDataSource(id, token) {
-  let cursor, rows = [];
+
+// Convert a date to YYYY.MM
+function formatDate(date) {
+  if (!date) return "";
+
+  return String(date)
+    .slice(0, 7)
+    .replace("-", ".");
+}
+
+// Format experience date range
+function experienceDate(page) {
+  const start = prop(page, "Start Date");
+  const end = prop(page, "End Date");
+
+  if (!start) return "";
+
+  return (
+    formatDate(start) +
+    " — " +
+    (end ? formatDate(end) : "Present")
+  );
+}
+
+// Convert a Notion page into website content
+function mapPage(page, section) {
+  const base = {
+    id: page.id,
+    title: prop(page, "Name"),
+    subtitle: prop(page, "Subtitle"),
+    date: prop(page, "Date"),
+    description: prop(page, "Description"),
+    details: prop(page, "Details"),
+    badge: prop(page, "Badge"),
+    link: prop(page, "Link"),
+    order: Number(prop(page, "Order") ?? 999)
+  };
+
+  // Experience uses a dedicated Notion schema
+  if (section === "experience") {
+    return {
+      ...base,
+
+      title:
+        prop(page, "Company") ||
+        prop(page, "Name"),
+
+      subtitle: prop(page, "Role"),
+
+      date: experienceDate(page),
+
+      description: prop(page, "Description"),
+
+      details: prop(page, "Details")
+    };
+  }
+
+  // Other sections retain their original schema
+  return base;
+}
+
+// Fetch all pages from a Notion data source
+async function queryDataSource(id, token, section) {
+  let cursor = null;
+  const rows = [];
+
   do {
-    const response = await fetch(`https://api.notion.com/v1/data_sources/${encodeURIComponent(id)}/query`, {
-      method:'POST',
-      headers:{Authorization:`Bearer ${token}`,'Notion-Version':'2025-09-03','Content-Type':'application/json'},
-      body:JSON.stringify({page_size:100,...(cursor?{start_cursor:cursor}:{})})
-    });
-    if(!response.ok) throw new Error(`Notion API status ${response.status}`);
+    const response = await fetch(
+      `https://api.notion.com/v1/data_sources/${encodeURIComponent(id)}/query`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Notion-Version": "2025-09-03",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          page_size: 100,
+          ...(cursor
+            ? { start_cursor: cursor }
+            : {})
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      console.error(
+        `Notion API error (${section}):`,
+        response.status,
+        errorText
+      );
+
+      throw new Error(
+        `Notion API status ${response.status}`
+      );
+    }
+
     const data = await response.json();
+
     rows.push(...data.results);
-    cursor = data.has_more ? data.next_cursor : null;
-  } while(cursor);
-  return rows.filter(p => p.properties?.Visible?.checkbox !== false)
-    .map(p => ({id:p.id,title:prop(p,'Name'),subtitle:prop(p,'Subtitle'),date:prop(p,'Date'),description:prop(p,'Description'),details:prop(p,'Details'),badge:prop(p,'Badge'),link:prop(p,'Link'),order:Number(prop(p,'Order') || 999)}))
-    .sort((a,b)=>a.order-b.order);
+
+    cursor = data.has_more
+      ? data.next_cursor
+      : null;
+
+  } while (cursor);
+
+  // Only show published content
+  return rows
+    .filter(page => {
+      const visible = prop(page, "Visible");
+
+      return visible !== false;
+    })
+    .map(page => mapPage(page, section))
+    .sort((a, b) => a.order - b.order);
 }
-module.exports = async (req,res) => {
-  if(req.method !== 'GET') return res.status(405).json({error:'Method not allowed'});
+
+// Main Vercel API handler
+module.exports = async (req, res) => {
+  if (req.method !== "GET") {
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
+  }
+
   const token = process.env.NOTION_TOKEN;
-  if(!token) return res.status(503).json({error:'Notion CMS is not configured'});
+
+  if (!token) {
+    return res.status(503).json({
+      error: "Notion CMS is not configured"
+    });
+  }
+
   try {
     const content = {};
-    for(const section of sections){
-      const id = process.env[envNames[section]];
-      if(id) content[section] = await queryDataSource(id,token);
+
+    for (const section of sections) {
+      const dataSourceId =
+        process.env[envNames[section]];
+
+      if (!dataSourceId) {
+        continue;
+      }
+
+      content[section] = await queryDataSource(
+        dataSourceId,
+        token,
+        section
+      );
     }
-    res.setHeader('Cache-Control','public, s-maxage=60, stale-while-revalidate=300');
+
+    // Cache for 60 seconds
+    res.setHeader(
+      "Cache-Control",
+      "public, s-maxage=60, stale-while-revalidate=300"
+    );
+
     return res.status(200).json(content);
-  } catch(e){console.error('Notion content error:',e.message);return res.status(502).json({error:'Content temporarily unavailable'});}
+
+  } catch (error) {
+    console.error(
+      "Notion content error:",
+      error.message
+    );
+
+    return res.status(502).json({
+      error: "Content temporarily unavailable"
+    });
+  }
 };
